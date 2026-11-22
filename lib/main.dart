@@ -347,6 +347,9 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
 
   late final AudioPlayer _audioPlayer;
   bool _isPlaying = false;
+  bool _isLoadingAudio = false;
+  bool _isAudioError = false;
+  Timer? _loadingNoticeTimer;
   String? _currentLoadedAsset;
   String? _audioNotice;
 
@@ -360,11 +363,31 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
     _audioPlayer = AudioPlayer();
     _audioPlayer.playerStateStream.listen((state) {
       if (!mounted) return;
-      final playing = state.playing &&
-          state.processingState != ProcessingState.completed;
-      setState(() {
-        _isPlaying = playing;
-      });
+      if (state.processingState == ProcessingState.completed) {
+        _loadingNoticeTimer?.cancel();
+        setState(() {
+          _isPlaying = false;
+          _isLoadingAudio = false;
+        });
+        return;
+      }
+
+      if (state.playing &&
+          (state.processingState == ProcessingState.ready ||
+              state.processingState == ProcessingState.buffering)) {
+        _loadingNoticeTimer?.cancel();
+        setState(() {
+          _isPlaying = true;
+          _isLoadingAudio = false;
+          _isAudioError = false;
+          _audioNotice = null;
+        });
+      } else if (!state.playing && !_isLoadingAudio) {
+        _loadingNoticeTimer?.cancel();
+        setState(() {
+          _isPlaying = false;
+        });
+      }
     });
 
     _pulseController = AnimationController(
@@ -404,33 +427,96 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
     DayMemoryFolder memory, {
     bool isAutoPlay = false,
   }) async {
-    final assetPath = memory.flowerStyle.audioAssetPath;
-    try {
-      setState(() {
-        _audioNotice = null;
-      });
+    if (_isLoadingAudio) return;
 
+    final assetPath = memory.flowerStyle.audioAssetPath;
+    _loadingNoticeTimer?.cancel();
+
+    setState(() {
+      _isLoadingAudio = true;
+      _isAudioError = false;
+      _audioNotice = null;
+    });
+
+    _loadingNoticeTimer = Timer(const Duration(milliseconds: 500), () {
+      if (!mounted || !_isLoadingAudio) return;
+      setState(() {
+        _isAudioError = false;
+        _audioNotice = 'Загрузка...';
+      });
+    });
+
+    try {
       if (_currentLoadedAsset != assetPath) {
+        await _audioPlayer.stop();
         await _audioPlayer.setAsset(assetPath);
         _currentLoadedAsset = assetPath;
       }
       await _audioPlayer.play();
-    } catch (_) {
+
+      _loadingNoticeTimer?.cancel();
       if (!mounted) return;
       setState(() {
+        _isLoadingAudio = false;
+        _isPlaying = true;
+        _isAudioError = false;
+        _audioNotice = null;
+      });
+    } catch (e) {
+      _loadingNoticeTimer?.cancel();
+      debugPrint('Audio playback error ($assetPath, auto=$isAutoPlay): $e');
+      if (!mounted) return;
+      setState(() {
+        _isLoadingAudio = false;
         _isPlaying = false;
-        _audioNotice = isAutoPlay
-            ? 'Браузер мог придержать звук — просто нажми «Включить музыку».'
-            : 'Пока не получилось включить "$assetPath". Загляни в assets/audio/ и pubspec.yaml.';
+        if (isAutoPlay) {
+          _isAudioError = false;
+          _audioNotice = null;
+        } else {
+          _isAudioError = true;
+          _audioNotice =
+              'Пока не получилось включить "$assetPath". Загляни в assets/audio/ и pubspec.yaml.';
+        }
       });
     }
   }
 
   Future<void> _togglePlayOrPause(DayMemoryFolder memory) async {
-    if (_isPlaying && _currentLoadedAsset == memory.flowerStyle.audioAssetPath) {
+    if (_isLoadingAudio) return;
+
+    final assetPath = memory.flowerStyle.audioAssetPath;
+
+    if (_isPlaying && _currentLoadedAsset == assetPath) {
       await _audioPlayer.pause();
+      if (!mounted) return;
+      setState(() {
+        _isPlaying = false;
+      });
       return;
     }
+
+    if (!_isPlaying && _currentLoadedAsset == assetPath) {
+      setState(() {
+        _isPlaying = true;
+        _isAudioError = false;
+        _audioNotice = null;
+      });
+      try {
+        await _audioPlayer.play();
+        if (!mounted) return;
+        setState(() {
+          _isPlaying = true;
+        });
+        return;
+      } catch (e) {
+        debugPrint('Audio resume error ($assetPath): $e');
+        if (!mounted) return;
+        setState(() {
+          _isPlaying = false;
+        });
+      }
+    }
+
     await _playFlowerMusicForMemory(memory, isAutoPlay: false);
   }
 
@@ -443,6 +529,12 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
   }
 
   Future<void> _onTabSelected(int idx) async {
+    if (idx == 0) {
+      _storyController.clear();
+      _pickedPhotos.clear();
+      _titleController.text = generateFolderTitle('', _selectedFlower);
+    }
+
     setState(() {
       _tabIndex = idx;
     });
@@ -536,7 +628,10 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
       _archive.insert(0, newMemory);
       _activeMemory = newMemory;
       _tabIndex = 1;
+      _pickedPhotos.clear();
     });
+    _storyController.clear();
+    _titleController.text = generateFolderTitle('', _selectedFlower);
 
     await _playFlowerMusicForMemory(newMemory, isAutoPlay: true);
   }
@@ -617,6 +712,7 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
 
   @override
   void dispose() {
+    _loadingNoticeTimer?.cancel();
     _storyController.dispose();
     _titleController.dispose();
     _pulseController.dispose();
@@ -1158,15 +1254,30 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
                   Row(
                     children: [
                       FilledButton.icon(
-                        onPressed: () => _togglePlayOrPause(memory),
+                        onPressed: _isLoadingAudio
+                            ? null
+                            : () => _togglePlayOrPause(memory),
                         style: FilledButton.styleFrom(
                           backgroundColor: style.primaryColor,
                         ),
-                        icon: Icon(
-                          isThisPlaying ? Icons.pause : Icons.play_arrow,
-                        ),
+                        icon: _isLoadingAudio
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              )
+                            : Icon(
+                                isThisPlaying ? Icons.pause : Icons.play_arrow,
+                              ),
                         label: Text(
-                          isThisPlaying ? 'Приостановить' : 'Включить музыку',
+                          _isLoadingAudio
+                              ? 'Загрузка...'
+                              : isThisPlaying
+                                  ? 'Приостановить'
+                                  : 'Включить музыку',
                         ),
                       ),
                       const SizedBox(width: 12),
@@ -1175,9 +1286,11 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              isThisPlaying
-                                  ? 'Звучит настроение дня: ${style.flowerName}'
-                                  : 'Мелодия под «${style.flowerName}» (${style.moodLabel})',
+                              _isLoadingAudio
+                                  ? 'Загрузка мелодии: ${style.flowerName}...'
+                                  : isThisPlaying
+                                      ? 'Звучит настроение дня: ${style.flowerName}'
+                                      : 'Мелодия под «${style.flowerName}» (${style.moodLabel})',
                               style: subHeadingStyle?.copyWith(fontSize: 14),
                             ),
                             Text(
@@ -1196,9 +1309,11 @@ class _DiaryHomeShellState extends State<DiaryHomeShell>
                     const SizedBox(height: 8),
                     Text(
                       _audioNotice!,
-                      style: const TextStyle(
+                      style: TextStyle(
                         fontSize: 12,
-                        color: Colors.redAccent,
+                        color: _isAudioError
+                            ? Colors.redAccent
+                            : Colors.grey[800],
                       ),
                     ),
                   ],
